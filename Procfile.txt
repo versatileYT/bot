@@ -1,3 +1,2 @@
 release: python -m playwright install chromium
 web: python bot_server.py
-
