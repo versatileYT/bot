@@ -9,10 +9,11 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 import os
+import subprocess
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # -------- Настройки через ENV --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -52,26 +53,40 @@ def send_telegram(text: str):
         except Exception as e:
             print("❌ Telegram error:", e)
 
+# -------- Playwright установка ---------
+def ensure_playwright_browsers():
+    """Скачиваем Chromium автоматически на Railway."""
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        send_telegram("✅ Chromium установлен автоматически.")
+    except Exception as e:
+        send_telegram(f"❌ Ошибка установки Chromium: {e}")
+
 # -------- Проверка сайта ---------
 async def goto_home(page: Page):
+    send_telegram("🌐 Переходим на главную страницу...")
     await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
     for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
         try:
             btn = page.locator(f"div:has-text('{txt}')").first
             await btn.click(timeout=5000)
+            send_telegram(f"✅ Нажата кнопка '{txt}'")
         except Exception:
             pass
 
 async def click_dalej(page: Page) -> bool:
     try:
         await page.locator("button:has-text('DALEJ'):not([disabled])").first.click(timeout=30_000)
+        send_telegram("➡️ Нажата кнопка DALEJ")
         return True
     except Exception:
         return False
 
 async def select_office_and_service(page: Page):
+    send_telegram(f"🏢 Выбираем офис: {OFFICE_TEXT}")
     await page.get_by_text(OFFICE_TEXT, exact=False).first.click(timeout=30_000)
     await click_dalej(page)
+    send_telegram(f"🛎 Выбираем услугу: {SERVICE_TEXT}")
     await page.get_by_text(SERVICE_TEXT, exact=False).first.click(timeout=30_000)
     await click_dalej(page)
 
@@ -89,6 +104,7 @@ async def choose_first_available_date(page: Page) -> Optional[str]:
             if not disabled:
                 txt = (await el.inner_text()).strip()
                 await el.click()
+                send_telegram(f"📅 Выбрана дата: {txt}")
                 return txt
         await asyncio.sleep(0.2)
     return None
@@ -106,6 +122,7 @@ async def choose_first_available_time(page: Page) -> Optional[str]:
         if not disabled:
             t = (await el.inner_text()).strip()
             await el.click()
+            send_telegram(f"⏰ Выбрано время: {t}")
             return t
     return None
 
@@ -113,57 +130,35 @@ async def fill_email_and_pesel(page):
     try:
         await page.get_by_label("E-mail *").fill(USER_DATA["Email"])
         await page.get_by_label("5 ostatnich znaków PESEL lub numeru paszportu *").fill(USER_DATA["PESEL"])
+        send_telegram("✅ Email и PESEL заполнены")
     except Exception as e:
-        print("❌ Ошибка автозаполнения Email/PESEL:", e)
+        send_telegram(f"❌ Ошибка автозаполнения Email/PESEL: {e}")
 
 async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
     page = await context.new_page()
     try:
-        send_telegram("🌐 Переходим на главную страницу...")
-        await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
-
-        send_telegram("📜 Принятие правил и куки...")
-        for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
-            try:
-                btn = page.locator(f"div:has-text('{txt}')").first
-                await btn.click(timeout=5000)
-                send_telegram(f"✅ Нажата кнопка '{txt}'")
-            except Exception:
-                pass
-
-        send_telegram(f"🏢 Выбираем офис: {OFFICE_TEXT}")
-        await page.get_by_text(OFFICE_TEXT, exact=False).first.click(timeout=30_000)
-        await click_dalej(page)
-        send_telegram(f"🛎 Выбираем услугу: {SERVICE_TEXT}")
-        await page.get_by_text(SERVICE_TEXT, exact=False).first.click(timeout=30_000)
-        await click_dalej(page)
+        await goto_home(page)
+        await select_office_and_service(page)
 
         date_str = await choose_first_available_date(page)
         if not date_str:
-            send_telegram("⚠️ Доступных дат нет, повтор через минуту...")
+            send_telegram("⚠️ Доступных дат нет.")
             await page.close()
             return None
-        send_telegram(f"📅 Выбрана дата: {date_str}")
 
         time_str = await choose_first_available_time(page)
         if not time_str:
-            send_telegram("⚠️ Доступного времени нет, повтор через минуту...")
+            send_telegram("⚠️ Доступного времени нет.")
             await page.close()
             return None
-        send_telegram(f"⏰ Выбрано время: {time_str}")
 
-        slot = FoundSlot(date_str=date_str, time_str=time_str)
-
-        send_telegram("✏️ Заполняем Email и PESEL...")
         await fill_email_and_pesel(page)
-        send_telegram("✅ Email и PESEL заполнены")
-
+        slot = FoundSlot(date_str=date_str, time_str=time_str)
         return slot
     except Exception as e:
         send_telegram(f"❌ Ошибка run_once: {e}")
         await page.close()
         return None
-
 
 # -------- Команды Telegram ---------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,6 +169,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["running"] = True
 
     async def checker_task():
+        ensure_playwright_browsers()  # Скачиваем Chromium
         async with async_playwright() as p:
             state["browser_context"] = await p.chromium.launch(headless=HEADLESS)
             while state["running"]:
@@ -183,7 +179,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         send_telegram(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
                     await asyncio.sleep(CHECK_INTERVAL_SEC)
                 except Exception as e:
-                    print("❌ Ошибка основного цикла:", e)
+                    send_telegram(f"❌ Ошибка основного цикла: {e}")
                     await asyncio.sleep(CHECK_INTERVAL_SEC)
 
     state["bg_task"] = asyncio.create_task(checker_task())
@@ -194,6 +190,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["running"] = False
     await update.message.reply_text("Остановка проверки...")
+    send_telegram("🛑 Проверка остановлена.")
 
 # -------- Main ---------
 async def main():
