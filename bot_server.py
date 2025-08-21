@@ -171,7 +171,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def checker_task():
         ensure_playwright_browsers()  # Скачиваем Chromium
         async with async_playwright() as p:
-            state["browser_context"] = await p.chromium.launch(headless=HEADLESS)
+            state["browser_context"] = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
             while state["running"]:
                 try:
                     slot = await run_once(state["browser_context"])
