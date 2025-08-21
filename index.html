@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Bez Kolejki — Панель</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#0b1220; color:#e6eefb;}
+    .wrap { max-width: 720px; margin: 0 auto; padding: 20px; }
+    .card { background: #111a2b; border-radius: 16px; padding: 18px; margin: 14px 0; box-shadow: 0 4px 20px rgba(0,0,0,.2); }
+    .row { display:flex; gap:12px; flex-wrap: wrap; align-items:center; }
+    .btn { padding: 12px 18px; border: none; border-radius: 12px; cursor: pointer; font-weight: 600; }
+    .btn-start { background:#2dd36f; color:#07110a; }
+    .btn-stop  { background:#ef4444; color:#fff; }
+    .badge { display:inline-block; padding:6px 10px; border-radius: 999px; font-size: 12px; }
+    .ok { background:#17361f; color:#2dd36f;}
+    .warn { background:#3d1f1f; color:#ef8888;}
+    code { background:#0b1220; padding:2px 6px; border-radius:8px;}
+    .muted { color:#9fb6d3; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Bez Kolejki — Статус</h2>
+
+    <div class="card">
+      <div class="row">
+        <div id="runningBadge" class="badge">—</div>
+        <div class="muted">Интервал проверки: <span id="interval">—</span> сек.</div>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn btn-start" onclick="doStart()">Запустить</button>
+        <button class="btn btn-stop" onclick="doStop()">Остановить</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div><b>Последняя проверка:</b> <span id="lastCheck">—</span></div>
+      <div><b>Событие:</b> <span id="lastEvent" class="muted">—</span></div>
+      <div><b>Последний слот:</b> <span id="lastSlot" class="muted">—</span></div>
+      <div><b>Ошибка:</b> <span id="lastError" class="muted">—</span></div>
+    </div>
+
+    <p class="muted">Открыто как Telegram WebApp — страница автообновляется каждые ~2 сек.</p>
+  </div>
+
+  <script>
+    async function fetchJSON(url, opts) {
+      const r = await fetch(url, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}));
+      return r.json();
+    }
+    async function refresh() {
+      try {
+        const s = await fetchJSON('/api/status');
+        document.getElementById('interval').textContent = s.interval_sec ?? '—';
+
+        const badge = document.getElementById('runningBadge');
+        if (s.running) {
+          badge.textContent = 'Работает';
+          badge.className = 'badge ok';
+        } else {
+          badge.textContent = 'Остановлен';
+          badge.className = 'badge warn';
+        }
+
+        document.getElementById('lastCheck').textContent = s.last_check_iso || '—';
+        document.getElementById('lastEvent').textContent = s.last_event || '—';
+        document.getElementById('lastError').textContent = s.last_error || '—';
+        const slot = s.last_found_slot ? `${s.last_found_slot.date} ${s.last_found_slot.time}` : '—';
+        document.getElementById('lastSlot').textContent = slot;
+      } catch(e) {
+        console.error(e);
+      }
+    }
+    async function doStart() {
+      await fetchJSON('/api/start', {method:'POST', body:'{}'});
+      await refresh();
+    }
+    async function doStop() {
+      await fetchJSON('/api/stop', {method:'POST', body:'{}'});
+      await refresh();
+    }
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
