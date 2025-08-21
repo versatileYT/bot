@@ -1,46 +1,33 @@
 #!/usr/bin/env python3
 """
-Telegram-бот для проверки дат.
-Команды:
-  /start  — старт проверки
-  /stop   — остановка проверки
-Бот пишет все действия в чат.
+Wrocław "Bez Kolejki" auto-booking bot (Playwright, Python).
+Полностью автоматическое бронирование с ручным вводом капчи через Telegram.
+Адаптировано для Railway.
 """
-
-import os
+from __future__ import annotations
 import asyncio
-from datetime import datetime
+import re
+from dataclasses import dataclass
+from typing import Optional
+import os
+import requests
+from playwright.async_api import async_playwright, Page, BrowserContext
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
-from checker import run_checker_forever, CheckerSettings, CheckerState
-
-# --------- ENV ----------
+# -------- Настройки через ENV --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-USER_EMAIL  = os.getenv("USER_EMAIL", "")
-USER_PESEL  = os.getenv("USER_PESEL", "")
+USER_EMAIL = os.getenv("USER_EMAIL", "")
+USER_PESAL = os.getenv("USER_PESEL", "")
 OFFICE_TEXT = os.getenv("OFFICE_TEXT", "USC przy ul. Włodkowica 20")
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "UT: Wpis zagranicznego urodzenia/małżeństwa/zgonu")
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", 60))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-# ------------------------
+BOOK_ASAP = True
 
-# ===== Глобальное состояние =====
-class GlobalState:
-    running: bool = False
-    bg_task: asyncio.Task | None = None
-    checker_state: CheckerState = CheckerState()
-
-state = GlobalState()
-
-# ===== Telegram =====
-async def send_message(text: str):
-    """Отправка сообщения в TG и лог в консоль."""
+# --------- Telegram ---------
+def send_telegram(text: str):
     print(text)
     if TELEGRAM_TOKEN and CHAT_ID:
-        import requests
         try:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -48,60 +35,125 @@ async def send_message(text: str):
                 timeout=10,
             )
         except Exception as e:
-            print("Telegram notify error:", e)
+            print("❌ Telegram error:", e)
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if state.running:
-        await update.message.reply_text("Проверка уже запущена.")
-        return
+# --------- Основные классы ---------
+@dataclass
+class FoundSlot:
+    date_str: str
+    time_str: str
 
-    await update.message.reply_text("Запускаю проверку дат...")
-    state.running = True
+USER_DATA = {
+    "PESEL": USER_PESAL,
+    "Email": USER_EMAIL,
+}
 
-    settings = CheckerSettings(
-        telegram_token=TELEGRAM_TOKEN,
-        chat_id=CHAT_ID,
-        user_email=USER_EMAIL,
-        user_pesel=USER_PESEL,
-        office_text=OFFICE_TEXT,
-        service_text=SERVICE_TEXT,
-        check_interval_sec=CHECK_INTERVAL_SEC,
-        headless=HEADLESS,
-    )
-
-    async def runner():
+# --------- Вспомогательные функции ---------
+async def goto_home(page: Page):
+    await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
+    # Кнопки акцепта правил/куки
+    for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
         try:
-            await run_checker_forever(settings, state.checker_state, stop_flag=lambda: not state.running)
-        except Exception as e:
-            await send_message(f"❌ Критическая ошибка: {e}")
-        finally:
-            state.running = False
-            await send_message("Проверка остановлена.")
+            btn = page.locator(f"div:has-text('{txt}')").first
+            await btn.click(timeout=5000)
+        except Exception:
+            pass
 
-    state.bg_task = asyncio.create_task(runner())
+async def click_dalej(page: Page) -> bool:
+    try:
+        await page.locator("button:has-text('DALEJ'):not([disabled])").first.click(timeout=30_000)
+        return True
+    except Exception:
+        return False
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not state.running:
-        await update.message.reply_text("Проверка не запущена.")
-        return
-    state.running = False
-    await update.message.reply_text("Остановка проверки...")
+async def select_office_and_service(page: Page):
+    await page.get_by_text(OFFICE_TEXT, exact=False).first.click(timeout=30_000)
+    await click_dalej(page)
+    await page.get_by_text(SERVICE_TEXT, exact=False).first.click(timeout=30_000)
+    await click_dalej(page)
 
-# ===== Main =====
+async def choose_first_available_date(page: Page) -> Optional[str]:
+    day_btns = page.get_by_role("button").filter(
+        has_text=re.compile(r"^\s*(?:[1-9]|[12]\d|3[01])\s*$")
+    )
+    for _ in range(25):
+        count = await day_btns.count()
+        for i in range(count):
+            el = day_btns.nth(i)
+            disabled = await el.evaluate(
+                "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+            )
+            if not disabled:
+                txt = (await el.inner_text()).strip()
+                await el.click()
+                return txt
+        await asyncio.sleep(0.2)
+    return None
+
+async def choose_first_available_time(page: Page) -> Optional[str]:
+    time_btns = page.get_by_role("button").filter(
+        has_text=re.compile(r"\b\d{1,2}:\d{2}\b")
+    )
+    await time_btns.first.wait_for(state="visible", timeout=10_000)
+    for i in range(await time_btns.count()):
+        el = time_btns.nth(i)
+        disabled = await el.evaluate(
+            "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+        )
+        if not disabled:
+            t = (await el.inner_text()).strip()
+            await el.click()
+            return t
+    return None
+
+async def fill_email_and_pesel(page):
+    try:
+        await page.get_by_label("E-mail *").fill(USER_DATA["Email"])
+        await page.get_by_label("5 ostatnich znaków PESEL lub numeru paszportu *").fill(USER_DATA["PESEL"])
+    except Exception as e:
+        print("❌ Ошибка автозаполнения Email/PESEL:", e)
+
+# --------- Основной запуск ---------
+async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
+    page = await context.new_page()
+    try:
+        await goto_home(page)
+        await select_office_and_service(page)
+        date_str = await choose_first_available_date(page)
+        if not date_str:
+            send_telegram("⚠️ Доступных дат нет, повтор через минуту...")
+            await page.close()
+            return None
+        time_str = await choose_first_available_time(page)
+        if not time_str:
+            send_telegram("⚠️ Доступного времени нет, повтор через минуту...")
+            await page.close()
+            return None
+        slot = FoundSlot(date_str=date_str, time_str=time_str)
+        if BOOK_ASAP:
+            await fill_email_and_pesel(page)
+        return slot
+    except Exception as e:
+        print("❌ Ошибка run_once:", e)
+        await page.close()
+        return None
+
 async def main():
-    if not TELEGRAM_TOKEN:
-        print("TELEGRAM_TOKEN не задан!")
-        return
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-
-    print("Запуск Telegram бота...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await asyncio.Event().wait()  # держим приложение живым
+    send_telegram("🟢 Бот Bez Kolejki запущен!")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=HEADLESS)
+        while True:
+            try:
+                slot = await run_once(browser)
+                if not slot:
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+                    continue
+                else:
+                    send_telegram(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+            except Exception as e:
+                print("❌ Ошибка основного цикла:", e)
+                await asyncio.sleep(CHECK_INTERVAL_SEC)
 
 if __name__ == "__main__":
     asyncio.run(main())
