@@ -212,14 +212,15 @@ async def start_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⏳ Нет доступных дат, проверяем снова через минуту...")
             await asyncio.sleep(CHECK_INTERVAL_SEC)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот получил команду /start")
-    context.application.create_task(start_search(update, context))
+from telegram.ext import Application, CommandHandler
 
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+async def start(update, context):
+    await update.message.reply_text("Бот запущен, начинаю поиск дат...")
+
+def main():
+    app = Application.builder().token("YOUR_TOKEN").build()
     app.add_handler(CommandHandler("start", start))
-    await app.run_polling()
+    app.run_polling()   # тут без await
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
