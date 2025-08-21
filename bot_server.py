@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Wrocław "Bez Kolejki" auto-booking bot (Playwright, Python).
-Полностью автоматическое бронирование с ручным вводом капчи через Telegram.
-Адаптировано для Railway.
+Запуск бота без проверки, проверка начинается только после /start.
 """
 from __future__ import annotations
 import asyncio
@@ -11,20 +10,36 @@ from dataclasses import dataclass
 from typing import Optional
 import os
 import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 # -------- Настройки через ENV --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 USER_EMAIL = os.getenv("USER_EMAIL", "")
-USER_PESAL = os.getenv("USER_PESEL", "")
+USER_PESEL = os.getenv("USER_PESEL", "")
 OFFICE_TEXT = os.getenv("OFFICE_TEXT", "USC przy ul. Włodkowica 20")
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "UT: Wpis zagranicznego urodzenia/małżeństwa/zgonu")
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", 60))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 BOOK_ASAP = True
 
-# --------- Telegram ---------
+# ===== Глобальное состояние =====
+@dataclass
+class FoundSlot:
+    date_str: str
+    time_str: str
+
+state = {
+    "running": False,
+    "bg_task": None,
+    "browser_context": None
+}
+
+USER_DATA = {"PESEL": USER_PESEL, "Email": USER_EMAIL}
+
+# -------- Telegram ---------
 def send_telegram(text: str):
     print(text)
     if TELEGRAM_TOKEN and CHAT_ID:
@@ -37,21 +52,9 @@ def send_telegram(text: str):
         except Exception as e:
             print("❌ Telegram error:", e)
 
-# --------- Основные классы ---------
-@dataclass
-class FoundSlot:
-    date_str: str
-    time_str: str
-
-USER_DATA = {
-    "PESEL": USER_PESAL,
-    "Email": USER_EMAIL,
-}
-
-# --------- Вспомогательные функции ---------
+# -------- Проверка сайта ---------
 async def goto_home(page: Page):
     await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
-    # Кнопки акцепта правил/куки
     for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
         try:
             btn = page.locator(f"div:has-text('{txt}')").first
@@ -113,7 +116,6 @@ async def fill_email_and_pesel(page):
     except Exception as e:
         print("❌ Ошибка автозаполнения Email/PESEL:", e)
 
-# --------- Основной запуск ---------
 async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
     page = await context.new_page()
     try:
@@ -138,22 +140,49 @@ async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
         await page.close()
         return None
 
+# -------- Команды Telegram ---------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if state["running"]:
+        await update.message.reply_text("Проверка уже запущена.")
+        return
+    await update.message.reply_text("Запускаю проверку дат...")
+    state["running"] = True
+
+    async def checker_task():
+        async with async_playwright() as p:
+            state["browser_context"] = await p.chromium.launch(headless=HEADLESS)
+            while state["running"]:
+                try:
+                    slot = await run_once(state["browser_context"])
+                    if slot:
+                        send_telegram(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+                except Exception as e:
+                    print("❌ Ошибка основного цикла:", e)
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+
+    state["bg_task"] = asyncio.create_task(checker_task())
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not state["running"]:
+        await update.message.reply_text("Проверка не запущена.")
+        return
+    state["running"] = False
+    await update.message.reply_text("Остановка проверки...")
+
+# -------- Main ---------
 async def main():
-    send_telegram("🟢 Бот Bez Kolejki запущен!")
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        while True:
-            try:
-                slot = await run_once(browser)
-                if not slot:
-                    await asyncio.sleep(CHECK_INTERVAL_SEC)
-                    continue
-                else:
-                    send_telegram(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
-                    await asyncio.sleep(CHECK_INTERVAL_SEC)
-            except Exception as e:
-                print("❌ Ошибка основного цикла:", e)
-                await asyncio.sleep(CHECK_INTERVAL_SEC)
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_TOKEN не задан!")
+        return
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    send_telegram("🟢 Бот запущен, ожидаем /start")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()  # держим приложение живым
 
 if __name__ == "__main__":
     asyncio.run(main())
