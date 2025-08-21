@@ -1,179 +1,201 @@
 #!/usr/bin/env python3
 """
-FastAPI + python-telegram-bot + WebApp панель.
-Команды в Telegram:
-  /start  — приветствие + кнопка "Открыть панель"
-Панель: показывает состояние, последние события; кнопки Старт/Стоп.
+Wrocław "Bez Kolejki" auto-booking bot (Playwright, Python).
+Запуск бота без проверки, проверка начинается только после /start.
+Использует рабочие функции с логированием офисов, услуг и дат.
 """
-
 from __future__ import annotations
 import asyncio
-import os
-from datetime import datetime, timezone
+import re
+from dataclasses import dataclass
 from typing import Optional
-
+import os
 import requests
-from fastapi import FastAPI, Response, status
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from playwright.async_api import async_playwright, Page, BrowserContext
 
-from checker import run_checker_forever, CheckerSettings, CheckerState
-
-# --------- ENV ----------
+# -------- Настройки через ENV --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-
-USER_EMAIL  = os.getenv("USER_EMAIL", "")
-USER_PESEL  = os.getenv("USER_PESEL", "")
+USER_EMAIL = os.getenv("USER_EMAIL", "")
+USER_PESEL = os.getenv("USER_PESEL", "")
 OFFICE_TEXT = os.getenv("OFFICE_TEXT", "USC przy ul. Włodkowica 20")
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "UT: Wpis zagranicznego urodzenia/małżeństwa/zgonu")
-
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))  # пауза между циклами, если нет дат
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", 60))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ваш домен Railway, например: https://yourapp.up.railway.app
-# ------------------------
+BOOK_ASAP = True
 
 # ===== Глобальное состояние =====
-class Global:
-    app_tg: Optional[Application] = None          # Telegram App
-    bg_task: Optional[asyncio.Task] = None        # фоновая задача с чекером
-    state = CheckerState()                        # состояние проверок (для панели)
-    running: bool = False                         # флаг «идут проверки»
+@dataclass
+class FoundSlot:
+    date_str: str
+    time_str: str
 
+state = {
+    "running": False,
+    "bg_task": None,
+    "browser_context": None
+}
 
-global_state = Global()
+USER_DATA = {"PESEL": USER_PESEL, "Email": USER_EMAIL}
 
-# ===== Утилиты TG =====
-def tg_notify(text: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print(f"[TG SKIP] {text}")
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
-            timeout=8,
-        )
-    except Exception as e:
-        print("Telegram notify error:", e)
-
-
-# ===== Telegram Handlers =====
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Кнопка WebApp — откроет нашу панель прямо в Telegram
-    web_url = PUBLIC_BASE_URL.rstrip("/") + "/webapp"
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Открыть панель", web_app=WebAppInfo(web_url))]]
-    )
-    await update.message.reply_text(
-        "Привет! Это панель управления ботом.\n"
-        "Нажми «Открыть панель», чтобы запустить/остановить проверки и смотреть статус.",
-        reply_markup=kb,
-    )
-
-
-# ===== FastAPI =====
-app = FastAPI(title="Bez Kolejki — Bot & Panel")
-
-# отдаём статик
-app.mount("/webapp", StaticFiles(directory="webapp", html=True), name="webapp")
-
-
-@app.get("/", include_in_schema=False)
-async def root():
-    # редиректим на панель
-    return FileResponse("webapp/index.html")
-
-
-@app.get("/api/status")
-async def api_status():
-    # вернём текущее состояние для панели
-    return JSONResponse(
-        {
-            "running": global_state.running,
-            "last_check_iso": global_state.state.last_check_iso,
-            "last_event": global_state.state.last_event,
-            "last_error": global_state.state.last_error,
-            "last_found_slot": global_state.state.last_found_slot,
-            "interval_sec": CHECK_INTERVAL_SEC,
-        }
-    )
-
-
-@app.post("/api/start")
-async def api_start():
-    if global_state.running:
-        return JSONResponse({"ok": True, "message": "Уже запущено"}, status_code=200)
-
-    # стартуем фоновую задачу
-    settings = CheckerSettings(
-        telegram_token=TELEGRAM_TOKEN,
-        chat_id=CHAT_ID,
-        user_email=USER_EMAIL,
-        user_pesel=USER_PESEL,
-        office_text=OFFICE_TEXT,
-        service_text=SERVICE_TEXT,
-        check_interval_sec=CHECK_INTERVAL_SEC,
-        headless=HEADLESS,
-    )
-
-    global_state.running = True
-    global_state.state.set_event("Проверки запущены из панели")
-
-    async def runner():
+# -------- Telegram ---------
+def send_telegram(text: str):
+    print(text)
+    if TELEGRAM_TOKEN and CHAT_ID:
         try:
-            await run_checker_forever(settings, global_state.state, stop_flag=lambda: not global_state.running)
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": text},
+                timeout=10,
+            )
         except Exception as e:
-            global_state.state.set_error(f"Критическая ошибка фоновой задачи: {e}")
-        finally:
-            global_state.running = False
+            print("❌ Telegram error:", e)
 
-    global_state.bg_task = asyncio.create_task(runner())
-    return JSONResponse({"ok": True, "message": "Запущено"})
-
-
-@app.post("/api/stop")
-async def api_stop():
-    if not global_state.running:
-        return JSONResponse({"ok": True, "message": "Уже остановлено"}, status_code=200)
-    global_state.running = False
-    global_state.state.set_event("Остановка запрошена")
-    # задача сама завершится на следующей итерации
-    return JSONResponse({"ok": True, "message": "Останавливаемся"})
-
-
-# ===== События жизненного цикла =====
-@app.on_event("startup")
-async def on_startup():
-    # стартуем Telegram-bot (polling) НЕ блокируя event loop FastAPI
-    if TELEGRAM_TOKEN:
-        application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        application.add_handler(CommandHandler("start", cmd_start))
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-        global_state.app_tg = application
-        print("Telegram bot polling started.")
-    else:
-        print("TELEGRAM_TOKEN не задан — Telegram-бот не запущен.")
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    # останавливаем фоновые задачи
-    global_state.running = False
-    if global_state.bg_task:
+# -------- Проверка сайта (рабочие функции с логами) ---------
+async def goto_home(page: Page):
+    await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
+    # Логирование кнопок согласия/куки
+    for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
         try:
-            await asyncio.wait_for(global_state.bg_task, timeout=10)
-        except asyncio.TimeoutError:
-            global_state.bg_task.cancel()
+            btn = page.locator(f"div:has-text('{txt}')").first
+            await btn.click(timeout=5000)
+            send_telegram(f"✅ Нажата кнопка '{txt}'")
+        except Exception:
+            pass
 
-    # останавливаем Telegram
-    if global_state.app_tg:
-        await global_state.app_tg.updater.stop()
-        await global_state.app_tg.stop()
-        await global_state.app_tg.shutdown()
-        print("Telegram bot stopped.")
+async def click_dalej(page: Page) -> bool:
+    try:
+        await page.locator("button:has-text('DALEJ'):not([disabled])").first.click(timeout=30_000)
+        send_telegram("➡️ Нажата кнопка DALEJ")
+        return True
+    except Exception:
+        return False
+
+async def select_office_and_service(page: Page):
+    offices = await page.get_by_text(OFFICE_TEXT, exact=False).all_inner_texts()
+    send_telegram(f"🏢 Офисы: {offices}")
+    await page.get_by_text(OFFICE_TEXT, exact=False).first.click(timeout=30_000)
+    await click_dalej(page)
+
+    services = await page.get_by_text(SERVICE_TEXT, exact=False).all_inner_texts()
+    send_telegram(f"🛎 Услуги: {services}")
+    await page.get_by_text(SERVICE_TEXT, exact=False).first.click(timeout=30_000)
+    await click_dalej(page)
+
+async def choose_first_available_date(page: Page) -> Optional[str]:
+    day_btns = page.get_by_role("button").filter(
+        has_text=re.compile(r"^\s*(?:[1-9]|[12]\d|3[01])\s*$")
+    )
+    dates = [await day_btns.nth(i).inner_text() for i in range(await day_btns.count())]
+    send_telegram(f"📅 Найденные даты: {dates}")
+    for i in range(await day_btns.count()):
+        el = day_btns.nth(i)
+        disabled = await el.evaluate(
+            "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+        )
+        if not disabled:
+            txt = (await el.inner_text()).strip()
+            await el.click()
+            return txt
+    return None
+
+async def choose_first_available_time(page: Page) -> Optional[str]:
+    time_btns = page.get_by_role("button").filter(
+        has_text=re.compile(r"\b\d{1,2}:\d{2}\b")
+    )
+    times = [await time_btns.nth(i).inner_text() for i in range(await time_btns.count())]
+    send_telegram(f"⏰ Найденное время: {times}")
+    for i in range(await time_btns.count()):
+        el = time_btns.nth(i)
+        disabled = await el.evaluate(
+            "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+        )
+        if not disabled:
+            t = (await el.inner_text()).strip()
+            await el.click()
+            return t
+    return None
+
+async def fill_email_and_pesel(page):
+    try:
+        await page.get_by_label("E-mail *").fill(USER_DATA["Email"])
+        await page.get_by_label("5 ostatnich znaków PESEL lub numeru paszportu *").fill(USER_DATA["PESEL"])
+        send_telegram("✅ Email и PESEL заполнены")
+    except Exception as e:
+        send_telegram(f"❌ Ошибка автозаполнения Email/PESEL: {e}")
+
+async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
+    page = await context.new_page()
+    try:
+        await goto_home(page)
+        await select_office_and_service(page)
+
+        date_str = await choose_first_available_date(page)
+        if not date_str:
+            send_telegram("⚠️ Доступных дат нет.")
+            await page.close()
+            return None
+
+        time_str = await choose_first_available_time(page)
+        if not time_str:
+            send_telegram("⚠️ Доступного времени нет.")
+            await page.close()
+            return None
+
+        await fill_email_and_pesel(page)
+        slot = FoundSlot(date_str=date_str, time_str=time_str)
+        return slot
+    except Exception as e:
+        send_telegram(f"❌ Ошибка run_once: {e}")
+        await page.close()
+        return None
+
+# -------- Команды Telegram ---------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if state["running"]:
+        await update.message.reply_text("Проверка уже запущена.")
+        return
+    await update.message.reply_text("Запускаю проверку дат...")
+    state["running"] = True
+
+    async def checker_task():
+        async with async_playwright() as p:
+            state["browser_context"] = await p.chromium.launch(headless=HEADLESS)
+            while state["running"]:
+                try:
+                    slot = await run_once(state["browser_context"])
+                    if slot:
+                        send_telegram(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+                except Exception as e:
+                    send_telegram(f"❌ Ошибка основного цикла: {e}")
+                    await asyncio.sleep(CHECK_INTERVAL_SEC)
+
+    state["bg_task"] = asyncio.create_task(checker_task())
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not state["running"]:
+        await update.message.reply_text("Проверка не запущена.")
+        return
+    state["running"] = False
+    await update.message.reply_text("Остановка проверки...")
+    send_telegram("🛑 Проверка остановлена.")
+
+# -------- Main ---------
+async def main():
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_TOKEN не задан!")
+        return
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    send_telegram("🟢 Бот запущен, ожидаем /start")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
