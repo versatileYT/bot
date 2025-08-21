@@ -119,26 +119,51 @@ async def fill_email_and_pesel(page):
 async def run_once(context: BrowserContext) -> Optional[FoundSlot]:
     page = await context.new_page()
     try:
-        await goto_home(page)
-        await select_office_and_service(page)
+        send_telegram("🌐 Переходим на главную страницу...")
+        await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
+
+        send_telegram("📜 Принятие правил и куки...")
+        for txt in ["AKCEPTUJĘ", "akceptuj", "Akceptuj"]:
+            try:
+                btn = page.locator(f"div:has-text('{txt}')").first
+                await btn.click(timeout=5000)
+                send_telegram(f"✅ Нажата кнопка '{txt}'")
+            except Exception:
+                pass
+
+        send_telegram(f"🏢 Выбираем офис: {OFFICE_TEXT}")
+        await page.get_by_text(OFFICE_TEXT, exact=False).first.click(timeout=30_000)
+        await click_dalej(page)
+        send_telegram(f"🛎 Выбираем услугу: {SERVICE_TEXT}")
+        await page.get_by_text(SERVICE_TEXT, exact=False).first.click(timeout=30_000)
+        await click_dalej(page)
+
         date_str = await choose_first_available_date(page)
         if not date_str:
             send_telegram("⚠️ Доступных дат нет, повтор через минуту...")
             await page.close()
             return None
+        send_telegram(f"📅 Выбрана дата: {date_str}")
+
         time_str = await choose_first_available_time(page)
         if not time_str:
             send_telegram("⚠️ Доступного времени нет, повтор через минуту...")
             await page.close()
             return None
+        send_telegram(f"⏰ Выбрано время: {time_str}")
+
         slot = FoundSlot(date_str=date_str, time_str=time_str)
-        if BOOK_ASAP:
-            await fill_email_and_pesel(page)
+
+        send_telegram("✏️ Заполняем Email и PESEL...")
+        await fill_email_and_pesel(page)
+        send_telegram("✅ Email и PESEL заполнены")
+
         return slot
     except Exception as e:
-        print("❌ Ошибка run_once:", e)
+        send_telegram(f"❌ Ошибка run_once: {e}")
         await page.close()
         return None
+
 
 # -------- Команды Telegram ---------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
