@@ -1,4 +1,0 @@
-playwright
-python-telegram-bot==20.7
-asyncio
-requests
