@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 Wrocław "Bez Kolejki" auto-booking bot (Playwright, Python) для запуска через Telegram.
+Работает на Railway или другом хостинге.
 """
+
 from __future__ import annotations
 import asyncio
 import re
@@ -10,6 +12,8 @@ from typing import Optional
 import requests
 import os
 from playwright.async_api import async_playwright, Page, Browser
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # -------- Переменные окружения --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -23,9 +27,9 @@ USER_DATA = {
 OFFICE_TEXT = os.getenv("OFFICE_TEXT", "USC przy ul. Włodkowica 20")
 SERVICE_TEXT = os.getenv("SERVICE_TEXT", "UT: Wpis zagranicznego urodzenia/małżeństwa/zgonu")
 
-CHECK_INTERVAL_SEC = (30, 60)
 ACTION_TIMEOUT_MS = 30_000
 BOOK_ASAP = True
+CHECK_INTERVAL_SEC = 60
 # --------------------------------------
 
 @dataclass
@@ -33,7 +37,7 @@ class FoundSlot:
     date_str: str
     time_str: str
 
-# ---------- Telegram ----------
+# ---------- Telegram Helper ----------
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
@@ -71,7 +75,7 @@ def get_new_telegram_message(last_id: int) -> Optional[str]:
         print("❌ Ошибка при получении Telegram сообщений:", e)
     return None
 
-# ---------- Логика работы бота ----------
+# ---------- Bot Logic ----------
 async def goto_home(page: Page):
     await page.goto("https://bez-kolejki.um.wroc.pl", timeout=25_000)
     try:
@@ -99,12 +103,16 @@ async def select_office_and_service(page: Page):
     await click_dalej(page)
 
 async def choose_first_available_date(page: Page) -> Optional[str]:
-    day_btns = page.get_by_role("button").filter(has_text=re.compile(r"^\s*(?:[1-9]|[12]\d|3[01])\s*$"))
+    day_btns = page.get_by_role("button").filter(
+        has_text=re.compile(r"^\s*(?:[1-9]|[12]\d|3[01])\s*$")
+    )
     for _ in range(25):
         count = await day_btns.count()
         for i in range(count):
             el = day_btns.nth(i)
-            disabled = await el.evaluate("(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'")
+            disabled = await el.evaluate(
+                "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+            )
             if not disabled:
                 txt = (await el.inner_text()).strip()
                 await el.click(force=True)
@@ -117,14 +125,16 @@ async def choose_first_available_time(page: Page) -> Optional[str]:
     await time_btns.first.wait_for(state="visible", timeout=10_000)
     for i in range(await time_btns.count()):
         el = time_btns.nth(i)
-        disabled = await el.evaluate("(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'")
+        disabled = await el.evaluate(
+            "(el) => el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'"
+        )
         if not disabled:
             t = (await el.inner_text()).strip()
             await el.click(force=True)
             return t
     return None
 
-async def fill_email_and_pesel(page):
+async def fill_email_and_pesel(page: Page):
     try:
         await page.get_by_label("E-mail *").fill(USER_DATA["Email"])
         await page.get_by_label("5 ostatnich znaków PESEL lub numeru paszportu *").fill(USER_DATA["PESEL"])
@@ -166,12 +176,14 @@ async def run_once(browser: Browser) -> Optional[FoundSlot]:
         if not date_str:
             await page.close()
             await context.close()
+            send_telegram("⚠️ Доступных дат нет")
             return None
 
         time_str = await choose_first_available_time(page)
         if not time_str:
             await page.close()
             await context.close()
+            send_telegram("⚠️ Доступного времени нет")
             return None
 
         slot = FoundSlot(date_str=date_str, time_str=time_str)
@@ -187,19 +199,27 @@ async def run_once(browser: Browser) -> Optional[FoundSlot]:
         await context.close()
         return None
 
-# ---------- Основной цикл ----------
-async def main():
-    send_telegram("🟢 Бот запущен и готов к проверке!")
+# ---------- Telegram Command Handlers ----------
+async def start_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Поиск слотов запущен!")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         while True:
             slot = await run_once(browser)
-            if not slot:
-                print("⏳ Нет доступных дат, ждем 60 секунд...")
-                await asyncio.sleep(60)
-                continue
+            if slot:
+                await update.message.reply_text(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
             else:
-                print(f"✅ Найден слот: {slot.date_str} {slot.time_str}")
+                await update.message.reply_text("⏳ Нет доступных дат, проверяем снова через минуту...")
+            await asyncio.sleep(CHECK_INTERVAL_SEC)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот получил команду /start")
+    context.application.create_task(start_search(update, context))
+
+async def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
