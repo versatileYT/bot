@@ -2,3 +2,4 @@ python-telegram-bot==20.5
 playwright==1.44.0
 requests
 Pillow
+beautifulsoup4
